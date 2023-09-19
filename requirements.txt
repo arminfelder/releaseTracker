@@ -1,0 +1,15 @@
+atoma==0.0.17
+attrs==23.1.0
+certifi==2023.7.22
+charset-normalizer==3.2.0
+defusedxml==0.7.1
+idna==3.4
+mypy==1.5.0
+mypy-extensions==1.0.0
+prometheus-client==0.17.1
+python-dateutil==2.8.2
+requests==2.31.0
+six==1.16.0
+sortedcontainers==2.4.0
+typing_extensions==4.7.1
+urllib3==2.0.4
