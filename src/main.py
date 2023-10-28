@@ -1,17 +1,15 @@
+#!/usr/local/bin/python3
 import json
+import os
 import re
 import time
 from abc import abstractmethod
-from pprint import pprint
-from random import random
+import datetime
 
-import atoma
-import mypy
 import prometheus_client
 import requests as requests
 import sortedcontainers as sortedcontainers
-from prometheus_client import start_http_server, Summary, values
-from requests.auth import HTTPBasicAuth
+from prometheus_client import start_http_server, CollectorRegistry, write_to_textfile
 
 
 class Version:
@@ -69,6 +67,10 @@ class VersionCollection:
         pass
 
     def __iadd__(self, other):
+        pass
+
+    @abstractmethod
+    def __iter__(self):
         pass
 
 class SemVer(Version):
@@ -182,10 +184,19 @@ class SemVerRevision(Version):
         else:
             return False
 
+    def __iter__(self):
+        pass
+
+    def __next__(self):
+        pass
+
 
 class SemVerCollecion:
     def __init__(self):
         self.versions = sortedcontainers.SortedDict()
+        self.__iter_major = None
+        self.__iter_minor = None
+        self.__iter_patch = None
 
     def __contains__(self, item: SemVer):
         if item.major in self.versions:
@@ -231,6 +242,33 @@ class SemVerCollecion:
         latest_release = patch_items[len(patch_items) - 1]
 
         return latest_release
+
+    def get_first_release(self):
+        major_keys = self.versions.keys()
+        major_key = major_keys[0]
+        minor_keys = self.versions[major_key].keys()
+        minor_key = minor_keys[0]
+        patch_keys = self.versions[major_key][minor_key]
+
+        first_release = patch_keys[0]
+
+        return first_release
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.__iter_major is None:
+            self.__iter_major = iter(self.versions)
+        major = next(self.__iter_major)
+        minor_dict = self.versions[major]
+        if self.__iter_minor is None:
+            self.__iter_minor = iter(minor_dict)
+        minor = next(self.__iter_minor)
+        patch_list = minor_dict[minor]
+        if self.__iter_patch is None:
+            self.__iter_patch = iter(patch_list)
+        patch = next(self.__iter_patch)
+        return patch
 
 
 class SemVerRevisionCollection:
@@ -289,6 +327,37 @@ class SemVerRevisionCollection:
 
         return latest_release
 
+    def get_first_release(self):
+        major_keys = self.versions.keys()
+        major_key = major_keys[0]
+        minor_keys = self.versions[major_key].keys()
+        minor_key = minor_keys[0]
+        patch_keys = self.versions[major_key][minor_key].keys()
+        patch_key = patch_keys[0]
+        revision_items = self.versions[major_key][minor_key][patch_key]
+
+        first_release = revision_items[0]
+
+        return first_release
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.__iter_major is None:
+            self.__iter_major = iter(self.versions)
+        major = next(self.__iter_major)
+        minor_dict = self.versions[major]
+        if self.__iter_minor is None:
+            self.__iter_minor = iter(minor_dict)
+        minor = next(self.__iter_minor)
+        patch_dict = minor_dict[minor]
+        if self.__iter_patch is None:
+            self.__iter_patch = iter(patch_dict)
+        patch = next(self.__iter_patch)
+        revision_list = patch_dict[patch]
+        if self.__iter_patch is None:
+            self.__iter_patch = iter(revision_list)
 
 class ReleaseSource:
     @abstractmethod
@@ -297,9 +366,13 @@ class ReleaseSource:
 
 
 class Github(ReleaseSource):
-    def __init__(self, options, version):
+    def __init__(self, options, token, version_limit):
+        """
+        :param options:
+        :param version_limit: version to stop scrolling back on
+        """
         self.__options = options
-        self.__current_version = version
+        self.__token = token
 
         self.__clean_tag_pattern = None
         if "tagRegEx" in self.__options:
@@ -317,12 +390,7 @@ class Github(ReleaseSource):
             self.version_type = SemVerRevision
         else:
             print("error")
-        self.config=self.load_config()
-        self.current_version = self.version_type(self.__current_version)
-
-    def load_config(self):
-        with open("config.json", "r") as f:
-            return json.load(f)
+        self.__version_limit = self.version_type(str(version_limit))
 
     def get_releases(self):
 
@@ -332,27 +400,20 @@ class Github(ReleaseSource):
         page = 1
         while True:
             response = requests.get(url, params={"per_page": 100, "page": page},
-                                    headers={"Authorization": "token {}".format(self.config["github_token"])})
+                                    headers={"Authorization": "token {}".format(self.__token)})
             data = response.json()
             if len(data):
                 release_versions = self.parse_releases_list(data)
                 versions += release_versions
 
-                if self.current_version in release_versions:
+                if self.__version_limit in release_versions:
                     break
 
             else:
                 break
             page += 1
 
-        latest_release = None
-        latest_patch = None
-        if not versions.is_empty():
-            latest_patch = versions.get_latest_patch(self.current_version)
-            latest_release = versions.get_latest_release()
-
-        return {"newest": latest_release, "patch": latest_patch}
-
+        return versions
 
     def parse_releases_list(self, releases: list):
         versions = self.version_collection_type()
@@ -378,39 +439,93 @@ class Github(ReleaseSource):
 
 
 class ReleaseChecker:
-    def __init__(self):
-        self.__load_software_list()
+    def __init__(self, interval, software_definition_config, credentials):
+        self.__interval = int(interval)
+        self.__software_config = software_definition_config
+        self.__credentials = credentials
+        self.__registry = CollectorRegistry()
+        self.__info = prometheus_client.Info(name="version",
+                                             documentation="release tracker",
+                                             labelnames=["installed",
+                                                         "instance_info",
+                                                         "latest_stable",
+                                                         "latest_patch",
+                                                         "product",
+                                                         "checked_at"],
+                                             namespace="release_tracker")
 
     def __load_software_list(self):
-        with open("software.json", "r") as f:
+        print("load config")
+        with open(self.__software_config, "r") as f:
             self.__software = json.load(f)
 
     def check_software_list(self):
         for software in self.__software:
             self.check_software_versions(software)
+        output = "test_metrics.prom"
+        write_to_textfile(output, self.__registry)
+
 
     def check_software_versions(self, software: dict):
         source_type = software["type"]
 
+        version_collection_type = VersionCollection
+        versioning = software["options"]["versioningSchema"]
+
+        if versioning == "semVer":
+            version_collection_type = SemVerCollecion
+            version_type = SemVer
+        elif versioning == "semVerRevision":
+            version_collection_type = SemVerRevisionCollection
+            version_type = SemVerRevision
+        else:
+            print("error")
+
+        versions = version_collection_type()
+
+        for instance in software["instances"]:
+            versions.insert(version_type(instance["version"]))
+
+        releases = version_collection_type()
         match source_type:
             case "github":
-                github = Github(options=software["options"], version=software["version"])
-                result = github.get_releases()
-
-                info = prometheus_client.Info(name=software["name"], documentation="test")
-                info.info(
-                    {"installed": software["version"], "latest": str(result["newest"]), "patch": str(result["patch"])})
+                github = Github(options=software["options"],
+                                token=self.__credentials["github"]["token"],
+                                version_limit=versions.get_first_release()
+                                )
+                releases = github.get_releases()
 
             case _:
                 print("{} not supported".format(type))
 
+        for instance in software["instances"]:
+            version = version_type(instance["version"])
+            latest_stable = releases.get_latest_release()
+            latest_patch = releases.get_latest_patch(version)
+            self.__info.labels(str(version),
+                               instance["id"],
+                               str(latest_stable),
+                               str(latest_patch),
+                               software["name"],
+                               datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
+                               )
+
+    def run(self):
+
+        start_http_server(8000)
+        while True:
+            self.__load_software_list()
+            self.check_software_list()
+            time.sleep(self.__interval)
+
 
 if __name__ == '__main__':
-    release_checker = ReleaseChecker()
+    interval = os.getenv("INTERVAL_SECONDS", "3600")
+    software_definition_config = os.getenv("SOFTWARE_CONFIG", "/app/software.json")
+    credentials = dict()
+    credentials["github"] = dict()
+    credentials["github"]["token"] = os.getenv("CREDENTIALS_GITHUB_TOKEN")
 
-    release_checker.check_software_list()
+    release_checker = ReleaseChecker(interval, software_definition_config, credentials)
 
-    start_http_server(8000)
-    # Generate some requests.
-    while True:
-        time.sleep(random())
+    release_checker.run()
